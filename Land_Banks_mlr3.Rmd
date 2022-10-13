@@ -1,0 +1,318 @@
+---
+title: "Land Banks with MLR3"
+output: html_document
+date: "2022-10-13"
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(ggmap)
+library(XML)
+library(purrr)
+library(leaflet)
+library(sf)
+library(readxl)
+library(tidymodels)
+library(themis)
+library(GGally)
+library(randomForest)
+library(mlr3)
+library(mlr3spatiotempcv)
+library(mlr3spatial)
+```
+
+## Separate doc
+
+So obviously the mlr and mlr3 packages conflict. But for whatever reason even loading the mlr package makes it so that the mlr3 package will _never_work, even if you detach the package and dependencies. Ugh. So here is the second part, using mlr3, which has the spatial machine learning algorithms which work much better on mapping data like we have. 
+
+
+
+So we have to load some data again
+
+Next, bringing in the map. Available through the Lawrence county FTP site. https://downloads.accuglobe.schneidergis.com/lawrenceoh/
+
+```{r}
+setwd("~/Code/Housing_Equity_3/Lawrence Parcels/")
+Lawrence_Geo <- sf::st_read("Parcels.shp")
+
+head(Lawrence_Geo)
+
+```
+
+
+
+This comes ith with no CRS so we have to add it in. 
+```{r}
+"st_crs"(Lawrence_Geo) <-"+proj=lcc +lat_1=38.73333333333333 +lat_2=40.03333333333333 +lat_0=38 +lon_0=-82.5 +x_0=600000.0000000001 +y_0=0 +datum=NAD83 +units=us-ft +no_defs"
+
+
+```
+
+
+
+Bringing in the delinquent data
+
+
+```{r}
+setwd("~/Code/Housing_Equity_3/")
+
+Lawrence_Land_data <- rio::import("lawrenceoh/DETINFO.txt") #from a FOIA
+
+
+Lawrence_Delinquents_All <- rio::import("Lawrence Current delinquent parcels.xlsx")
+
+```
+
+
+
+land bank properties. 
+
+We got this from a FOIA. 
+
+
+```{r} 
+setwd("~/Code/Housing_Equity_3")
+Lawrence_LB_for_sale <- read_excel("LawrenceCounty_PFS-FullPage.xlsx") %>% 
+  mutate(type="property_for_sale")
+
+Lawrence_LB_sold <- rio::import("LawrenceCounty_PSold-FullPage.xlsx")%>% 
+  mutate(type="sold_property")
+
+
+
+Lawrence_LB_All <- rbind( 
+  (Lawrence_LB_sold %>% dplyr::select(Address,Township,SalePrice,PropertyID,type)),  
+  (Lawrence_LB_for_sale %>% dplyr::select(Address,Township,SalePrice,PropertyID,type))) 
+
+Lawrence_LB_All <- Lawrence_LB_All %>% 
+  distinct(PropertyID, .keep_all = TRUE) #This fixes 35-053-0900.000 which was in there twice. 
+
+
+
+
+```
+
+Let's take a look at where all those properties are. 
+
+```{r}
+Lawrence_LB_Geo <- Lawrence_Geo %>% 
+  filter(PARCEL %in%  Lawrence_LB_All$PropertyID)
+
+Lawrence_LB_Geo <- st_as_sf(Lawrence_LB_Geo)
+Lawrence_LB_Geo <- st_transform(Lawrence_LB_Geo, crs= 4326)
+
+```
+
+This causes four parcels, 09-037-0300.000,  23-162-0900.000, 23-212-0080.000, 35-032-1800.000 to come up twice. 
+
+
+
+###Combining Data
+
+Okay now we have data from multiple sources that we will be bringing together based on the property number. 
+
+
+First, the land bank data does not have an amount owed or year certified. Well we have it, but it doesn't show the amount owed in taxes when the property went to the land bank and it doesn't show the year it was certified delinquent before going to the land bank. To gather this data, we had to make multiple trips to Lawrence County and look up all 385 by hand which took many hours. 
+
+Most counties have tax data going back several years on their websites, but for some reason Lawrence only has two. Note: this probably also introduces typos into our dataset, but unfortunately that was the only way. 
+
+The land bank data does not overlap with the delinquent data. 
+
+
+
+```{r}
+setwd("~/Code/Housing_Equity_3")
+
+
+Lawrence_LB_with_Tax <- rio::import("~/Code/Housing_Equity_3/Lawrence Land Bank Property Values - Sheet1.csv")
+
+Lawrence_data <- Lawrence_Geo %>% 
+  filter(PARCEL %in% Lawrence_LB_with_Tax$PropertyID | PARCEL %in% Lawrence_Delinquents_All$`Parcel Number`) %>% 
+  select(-COMPNUM) %>% 
+  #select(mpropertyNumber, TotValue, priorDelqOwedTot, propertyLand, ImprLand, CertDelqYear) %>%
+  mutate(Land_Bank=if_else(PARCEL %in% Lawrence_LB_with_Tax$PropertyID,1,0)) %>% 
+  mutate(amount_owed=if_else(PARCEL %in% Lawrence_LB_with_Tax$PropertyID,Lawrence_LB_with_Tax$Amount[match(PARCEL, Lawrence_LB_with_Tax$PropertyID)],as.character(Lawrence_Delinquents_All$Amount[match(PARCEL, Lawrence_Delinquents_All$`Parcel Number`)]))) %>%
+  mutate(Certified_Delinquent_Year=if_else(PARCEL %in% Lawrence_LB_with_Tax$PropertyID,Lawrence_LB_with_Tax$Year_Certified_Delinquent[match(PARCEL, Lawrence_LB_with_Tax$PropertyID)], as.integer(Lawrence_Delinquents_All$`Certified Year`[match(PARCEL, Lawrence_Delinquents_All$`Parcel Number`)]))) %>% 
+  mutate(years_delinquent=if_else(PARCEL %in% Lawrence_LB_with_Tax$PropertyID,Lawrence_LB_with_Tax$Years_On_Delinquent_Tax_Roll_Before_LB_Transfer[match(PARCEL, Lawrence_LB_with_Tax$PropertyID)],2022-Certified_Delinquent_Year)) 
+
+
+Lawrence_data$amount_owed <- as.double(Lawrence_data$amount_owed)
+  
+
+```
+
+#Creating a Spatial Task
+
+Based off off the Ecuador landslides [project.](https://mlr3book.mlr-org.com/special.html#spatiotemporal)
+
+
+
+
+```{r}
+library(mlr3spatiotempcv)
+library(geosphere)
+
+Lawrence_Spatial_ML <- Lawrence_data %>% 
+  select(-PARCEL, -OWNER, -ADDRESS, -Certified_Delinquent_Year) %>% 
+  mutate(Centroid_Coordinates=st_centroid(geometry)) 
+
+
+Lawrence_Centers <- as_tibble(cbind(Lawrence_Spatial_ML$Centroid_Coordinates, Lawrence_Spatial_ML$ACRES, Lawrence_Spatial_ML$Land_Bank, Lawrence_Spatial_ML$amount_owed, Lawrence_Spatial_ML$years_delinquent)) 
+
+Lawrence_Centers <- Lawrence_Centers %>% 
+  rename(Centroid_Coordinates=V1, ACRES=V2,Land_Bank=V3, amount_owed=V4, years_delinquent=V5)
+
+Lawrence_Centers <- separate(Lawrence_Centers, Centroid_Coordinates, c("x","y"), sep = ",", remove = TRUE)
+
+
+Lawrence_Centers <- Lawrence_Centers %>% 
+  mutate(x=str_remove(x,"^..")) %>% 
+  mutate(y=str_remove(y,".$"))
+
+
+Lawrence_Centers$ACRES <- as.numeric(Lawrence_Centers$ACRES)
+Lawrence_Centers$Land_Bank <- as.character(Lawrence_Centers$Land_Bank)
+Lawrence_Centers$Land_Bank <- as.factor(Lawrence_Centers$Land_Bank)
+Lawrence_Centers$amount_owed <- as.numeric(Lawrence_Centers$amount_owed)
+Lawrence_Centers$years_delinquent <- as.integer(Lawrence_Centers$years_delinquent)
+```
+
+
+
+
+
+# create `TaskClassifST` from `sf` object
+```{r}
+
+# create 'sf' object
+data_sf = sf::st_as_sf(Lawrence_Centers, coords = c("x", "y"), crs = 4326)
+
+task = as_task_classif_st(data_sf, id = "Lawrence_Spatial_Task", target = "Land_Bank", positive = "1" )
+
+print(task)
+```
+
+
+
+
+
+# Imbalance correction
+
+See [here](https://mlr-org.com/gallery/2020-03-30-imbalanced-data/) for more. 
+
+```{r}
+table(task$truth())
+```
+
+
+
+creating spatial cross-validation
+
+
+```{r}
+
+learner = lrn("classif.rpart", maxdepth = 3, predict_type = "prob")
+resampling_sp = rsmp("repeated_spcv_coords", folds = 4, repeats = 2)
+rr_sp = resample(
+  task = task, learner = learner,
+  resampling = resampling_sp)
+```
+
+What's the accuracy and classification error? 
+
+```{r}
+rr_sp$aggregate(measures = msr("classif.ce"))
+rr_sp$aggregate(measures = msr("classif.acc"))
+```
+
+
+
+Get a confusion matrix of a split. 
+```{r}
+# split into training and test
+splits = partition(task, ratio = 0.8)
+print(str(splits))
+pred = learner$train(task, splits$train)$predict(task, splits$test)
+pred$confusion
+```
+Looking good. For reference: 
+
+*The upper left quadrant-the number of times our model predicted the positive class and was correct about it. 
+*the lower right quadrant- the number of times our model predicted the negative class and was also correct about it. (Together, the elements on the diagonal are called True Positives  and True Negatives . 
+*The upper right quadrant= the number of times we falsely predicted a positive label( and is called (False Positives. 
+*The lower left quadrant- False Negatives (FN).
+
+We wanted to look at this to make sure that we are not training an algorithm to just guess no most of the time (because ususally the answer is no) and getting a better accuracy at the cost of having a good model. 
+
+
+#Vizualizing this
+
+For example, here are the first four partitions of the first repetition
+
+```{r}
+autoplot(resampling_sp, task, fold_id = c(1:4), size = 0.7) *
+  ggplot2::scale_y_continuous(breaks = seq(-37.57, -39.57, -0.01)) *
+  ggplot2::scale_x_continuous(breaks = seq(-81.53, -83.53 -0.02))
+```
+
+
+
+But how important is the location of each one? 
+
+
+#Still working on this part
+
+creating raster from a polygon
+```{r}
+#poly <- terra::vect("POLYGON((-82.83899884075605 38.3598482527471,-82.15076068814281 #38.3598482527471,-82.15076068814281 38.77151080216299,-82.83899884075605 #38.77151080216299,-82.83899884075605 38.3598482527471))","polygons", crs=4326)
+
+#based on Lawrence County
+x_coords <- c(-82.83899884075605, -82.15076068814281,-82.15076068814281, -82.83899884075605, -82.83899884075605)
+y_coords <- c(38.3598482527471, 38.3598482527471, 38.77151080216299, 38.77151080216299, 38.3598482527471)
+poly1 <- sp::Polygon(cbind(x_coords,y_coords))
+firstPoly <- sp::Polygons(list(poly1), ID = "A")
+
+str(firstPoly,1)
+
+firstSpatialPoly <- sp::SpatialPolygons(list(firstPoly))
+
+plot(firstSpatialPoly)
+
+r <- raster(ncol=10000, nrow=10000)
+
+#r <- rasterize(poly, r, fun=sum)
+extent(r) <- extent(firstSpatialPoly)
+
+r <- terra::rast(r)
+
+
+p <- raster::rasterToPoints(r)
+
+plot(p)
+```
+
+Predicting where future points will be. 
+
+```{r}
+tsk_predict = as_task_unsupervised(r)
+
+lrn = lrn("classif.ranger")
+lrn$train(task)
+
+# plan("multisession") # optional parallelization
+pred = predict_spatial(tsk_predict, lrn, format = "terra")
+class(pred)
+
+library(terra, exclude = "resample")
+plot(pred, col = c("#440154FF", "#FDE725FF"))
+```
+
+
+
+
+
+
