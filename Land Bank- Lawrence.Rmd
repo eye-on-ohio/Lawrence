@@ -1,0 +1,643 @@
+---
+title: "Land Bank AI"
+author: "Lucia Walinchus"
+date: "Spring 2022"
+output: html_document
+---
+
+```{r setup, include=TRUE}
+library(dplyr)
+library(ggplot2)
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(ggmap)
+library(XML)
+library(purrr)
+library(leaflet)
+library(sf)
+library(readxl)
+library(tidymodels)
+library(themis)
+library(GGally)
+library(randomForest)
+library(xgboost)
+library(mlr3)
+library(mlr3spatiotempcv)
+library(mlr3spatial)
+
+
+
+```
+
+The land bank is a great program, but it's a very limited program. 
+
+
+This is similar to the analysis we did for this story[on Land Banks.](https://eyeonohio.com/how-do-public-officials-make-land-bank-decisions-artificial-intelligence-may-seek-patterns/)
+
+After it ran, we got several tips of other counties where officials may have used this power to benefit themselves or others. 
+
+We are looking first at Lawrence County, where we found our most egregious tip. 
+
+### Loading Data
+
+First, figuring out which properties are land bank properties. 
+
+We got this from a FOIA. 
+
+
+```{r} 
+setwd("~/Code/Housing_Equity_3")
+Lawrence_LB_for_sale <- read_excel("LawrenceCounty_PFS-FullPage.xlsx") %>% 
+  mutate(type="property_for_sale")
+
+Lawrence_LB_sold <- rio::import("LawrenceCounty_PSold-FullPage.xlsx")%>% 
+  mutate(type="sold_property")
+
+
+
+Lawrence_LB_All <- rbind( 
+  (Lawrence_LB_sold %>% dplyr::select(Address,Township,SalePrice,PropertyID,type)),  
+  (Lawrence_LB_for_sale %>% dplyr::select(Address,Township,SalePrice,PropertyID,type))) 
+
+Lawrence_LB_All <- Lawrence_LB_All %>% 
+  distinct(PropertyID, .keep_all = TRUE) #This fixes 35-053-0900.000 which was in there twice. 
+
+
+
+
+```
+
+
+
+
+
+
+How often do parcels get foreclosed or go to the Land bank?
+
+```{r}
+Lawrence_LB_sold$SaleDate <-  mdy(Lawrence_LB_sold$SaleDate)
+
+ggplot(Lawrence_LB_sold, aes(x=SalePrice))+
+  geom_histogram()+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1.2, hjust = 1.1))
+```
+
+
+
+And now finding delinquents. The full delinquent list is available on their website: https://lawrencecountyauditor.org/DelinquencyReport?SortColumn=Parcel%20Number&ResultsPerPage=8&pageNumber=4
+
+
+Also there were several that had no date that we had to follow up on. 
+
+As per the county auditor via email: 
+*06-100-0700.000   $0.00 balance, paid 4/12/22
+*14-068-0500.000   Certified Delinquent 2021 pay 2022
+*18-001-1270.000   Certified Delinquent 2021 pay 2022
+*18-001-1717.000   Certified Delinquent 2021 pay 2022
+*18-045-0700.000   $0.00 balance, paid 3/11/22
+*34-003-1600.000   Certified Delinquent 2021 pay 2022
+*36-120-1200.000   $0.00 balance, paid 7/14/22
+
+
+```{r}
+setwd("~/Code/Housing_Equity_3/")
+
+Lawrence_Land_data <- rio::import("lawrenceoh/DETINFO.txt") #from a FOIA
+
+
+Lawrence_Delinquents_All <- rio::import("Lawrence Current delinquent parcels.xlsx")
+
+```
+
+
+
+
+
+Next, bringing in the map. Available through the Lawrence county FTP site. https://downloads.accuglobe.schneidergis.com/lawrenceoh/
+
+```{r}
+setwd("~/Code/Housing_Equity_3/Lawrence Parcels/")
+Lawrence_Geo <- sf::st_read("Parcels.shp")
+
+head(Lawrence_Geo)
+
+```
+
+
+This comes ith with no CRS so we have to add it in. 
+```{r}
+"st_crs"(Lawrence_Geo) <-"+proj=lcc +lat_1=38.73333333333333 +lat_2=40.03333333333333 +lat_0=38 +lon_0=-82.5 +x_0=600000.0000000001 +y_0=0 +datum=NAD83 +units=us-ft +no_defs"
+
+
+```
+
+
+
+Let's take a look at where all those properties are. 
+
+```{r}
+Lawrence_LB_Geo <- Lawrence_Geo %>% 
+  filter(PARCEL %in%  Lawrence_LB_All$PropertyID)
+
+```
+
+This causes four parcels, 09-037-0300.000,  23-162-0900.000, 23-212-0080.000, 35-032-1800.000 to come up twice. 
+
+
+
+And plotting them
+```{r}
+Lawrence_LB_Geo <- st_as_sf(Lawrence_LB_Geo)
+
+plot(Lawrence_LB_Geo %>% select(PARCEL, geometry))
+```
+
+Adding a background map
+
+
+
+```{r}
+setwd("~/Code/Housing_Equity_3/")
+Lawrence_LB_Geo <- st_transform(Lawrence_LB_Geo, crs= 4326)
+
+#, CRS("+proj=longlat +datum=WGS84"))
+
+Lawrence_LB_Geo <- st_zm(Lawrence_LB_Geo, drop = T, what="ZM")
+
+Lawrence_Properties_plotted <- leaflet(data = Lawrence_LB_Geo) %>% 
+  addPolygons(data = Lawrence_LB_Geo$geometry) %>% 
+  addTiles() %>% 
+  setView(-82.53328542385822,38.57712964987033, zoom = 10) %>% #Set to Lawrence County Center
+  addPolygons(data = Lawrence_LB_Geo$geometry,  options = tileOptions(minZoom = 0, maxZoom = 14, continuousWorld = T), popup = paste("Parcel Number: ", Lawrence_LB_Geo$PARCEL))
+  
+Lawrence_Properties_plotted
+```
+
+
+And where are the delinquent properties? 
+
+
+```{r}
+
+
+Lawrence_Delinquent_Geo <- Lawrence_Geo %>% 
+  filter(PARCEL %in%  Lawrence_Delinquents_All$`Parcel Number`)
+
+Lawrence_Delinquent_Geo <- st_transform(Lawrence_Delinquent_Geo, crs= 4326)
+
+Lawrence_Delinquent_Geo <- st_as_sf(Lawrence_Delinquent_Geo)
+
+plot(Lawrence_Delinquent_Geo %>% select(PARCEL, geometry))
+
+```
+
+```{r}
+Lawrence_Delinquent_Geo <- st_zm(Lawrence_Delinquent_Geo, drop = T, what="ZM")
+
+Lawrence_Properties_plotted_with_delinquents <- leaflet(data = Lawrence_Delinquent_Geo) %>% 
+  #addPolygons(data = Lawrence_LB_Geo$geometry, color ="blue") %>% 
+  addTiles() %>% 
+  setView(-82.53328542385822,38.57712964987033, zoom = 10) %>% #Set to Lawrence County Center
+  addPolygons(data = Lawrence_LB_Geo$geometry, color = "blue", options = tileOptions(minZoom = 0, maxZoom = 14, continuousWorld = T), popup = paste("Parcel Number: ", Lawrence_LB_Geo$PARCEL)) %>% 
+  addPolygons(data = Lawrence_Delinquent_Geo$geometry, color = "purple",   options = tileOptions(minZoom = 0, maxZoom = 14, continuousWorld = T), popup = paste("Parcel Number: ", Lawrence_Delinquent_Geo$PARCEL))
+  
+Lawrence_Properties_plotted_with_delinquents
+```
+
+
+
+###Combining Data
+
+Okay now we have data from multiple sources that we will be bringing together based on the property number. 
+
+
+First, the land bank data does not have an amount owed or year certified. Well we have it, but it doesn't show the amount owed in taxes when the property went to the land bank and it doesn't show the year it was certified delinquent before going to the land bank. To gather this data, we had to make multiple trips to Lawrence County and look up all 385 by hand which took many hours. 
+
+Most counties have tax data going back several years on their websites, but for some reason Lawrence only has two. Note: this probably also introduces typos into our dataset, but unfortunately that was the only way. 
+
+The land bank data does not overlap with the delinquent data. 
+
+
+
+```{r}
+
+Lawrence_LB_with_Tax <- rio::import("~/Code/Housing_Equity_3/Lawrence Land Bank Property Values - Sheet1.csv")
+
+Lawrence_data <- Lawrence_Geo %>% 
+  filter(PARCEL %in% Lawrence_LB_with_Tax$PropertyID | PARCEL %in% Lawrence_Delinquents_All$`Parcel Number`) %>% 
+  select(-COMPNUM) %>% 
+  #select(mpropertyNumber, TotValue, priorDelqOwedTot, propertyLand, ImprLand, CertDelqYear) %>%
+  mutate(Land_Bank=if_else(PARCEL %in% Lawrence_LB_with_Tax$PropertyID,1,0)) %>% 
+  mutate(amount_owed=if_else(PARCEL %in% Lawrence_LB_with_Tax$PropertyID,Lawrence_LB_with_Tax$Amount[match(PARCEL, Lawrence_LB_with_Tax$PropertyID)],as.character(Lawrence_Delinquents_All$Amount[match(PARCEL, Lawrence_Delinquents_All$`Parcel Number`)]))) %>%
+  mutate(Certified_Delinquent_Year=if_else(PARCEL %in% Lawrence_LB_with_Tax$PropertyID,Lawrence_LB_with_Tax$Year_Certified_Delinquent[match(PARCEL, Lawrence_LB_with_Tax$PropertyID)], as.integer(Lawrence_Delinquents_All$`Certified Year`[match(PARCEL, Lawrence_Delinquents_All$`Parcel Number`)]))) %>% 
+  mutate(years_delinquent=if_else(PARCEL %in% Lawrence_LB_with_Tax$PropertyID,Lawrence_LB_with_Tax$Years_On_Delinquent_Tax_Roll_Before_LB_Transfer[match(PARCEL, Lawrence_LB_with_Tax$PropertyID)],2022-Certified_Delinquent_Year)) 
+
+
+Lawrence_data$amount_owed <- as.double(Lawrence_data$amount_owed)
+  
+
+```
+
+
+Note, unlike previous analyses we are not bringing in the local school district as it appears from the (Ohio Department of Education)[https://education.ohio.gov/Topics/Ohio-Education-Options/Open-Enrollment] that this county is all open enrollment. 
+
+
+
+
+
+Next, we want to see if the location near the river is a factor. 
+
+
+Where is the river? The geography database has polygons labeled "river."
+
+
+
+```{r}
+
+Lawrence_River <- Lawrence_Geo %>% 
+  filter(COMPNUM=="RIVER") %>% 
+  select(COMPNUM, geometry)
+
+
+plot(Lawrence_River)
+
+```
+So apparently four parcels, 09-037-0300.000,  23-162-0900.000, 23-212-0080.000, 35-032-1800.000, which are not duplicated in the original set are duplicated here.  They come up as two shapes each. This shouldn't affect our analysis much but noting it here to follow up with later.
+
+
+
+How close are they to our properties?
+
+```{r }
+library(lwgeom)
+
+sf::sf_use_s2(FALSE)
+
+Lawrence_River <- st_transform(Lawrence_River, crs= 4326)
+
+Lawrence_River <- st_as_sf(Lawrence_River)
+
+Lawrence_LB_Geo <- Lawrence_LB_Geo %>% distinct(PARCEL, .keep_all = TRUE)
+
+Lawrence_data <- st_transform(Lawrence_data, crs= 4326)
+
+Lawrence_data <- st_as_sf(Lawrence_data)
+
+Lawrence_data <- Lawrence_data %>% distinct(PARCEL, .keep_all = TRUE)
+
+
+Lawrence_Distance_Matrix <- as.data.frame(st_distance(  Lawrence_River$geometry, Lawrence_data$geometry,)) #This takes quite a while just FYI
+
+
+
+  #Sets column names
+  
+Lawrence_Distance_Matrix1 <- Lawrence_Distance_Matrix %>% 
+  `colnames<-`(Lawrence_data$PARCEL ) # %>% 
+  
+  #Adds a column containing names so that each row now also has a name
+  #cbind(name = Lawrence_River$COMPNUM  ) #This actually doesn't help as they are all called "river"
+#Lawrence_Distance_Matrix1 is the same as Lawrence_Distance_Matrix but with the parcel number down the side  and column names on top so we don't get confused. But obviously that is just a label and not actually part of the calculations (aka a bad data practice) which is why we keep Lawrence Distance Matrix as well.
+
+```
+
+
+
+Removing the units 
+
+```{r}
+library(units)
+Lawrence_Distance_Matrix_No_Units <- drop_units(Lawrence_Distance_Matrix1)
+```
+Now we need to see if each parcel is close to the river. This distance matrix gives us the distance between each parcel and the river. We don't care about how many river parcels are close; we just want to know how close each parcel is to the closet part of the river. 
+
+
+
+Finding the smallest distance 
+
+```{r}
+Lawrence_Smallest_Distance <- Lawrence_Distance_Matrix_No_Units %>%                                                                                  
+  dplyr::summarise_all(~min(.))
+```
+
+
+```{r}
+Lawrence_Distance_Info1 <-Lawrence_Smallest_Distance %>% 
+  pivot_longer("18-205-0900.000":"12-076-1600.022", names_to = "PARCEL", values_to = "Distance_To_River_In_Meters" )
+```
+
+
+Adding them together
+
+```{r}
+Lawrence_data <- left_join(Lawrence_data, Lawrence_Distance_Info1, by="PARCEL")
+```
+
+Which properties were just near the river, period?
+```{r}
+Lawrence_data  <- Lawrence_data %>% 
+  mutate(Within_half_mile=if_else(Distance_To_River_In_Meters<805,1,0)) %>% 
+ mutate(Within_mile=if_else(Distance_To_River_In_Meters<1609,1,0))          
+```
+
+
+###Basic Data Exploration
+
+```{r}
+summary(Lawrence_data)
+```
+Unfortunately, it looks like Lawrence takes the sale price ($0) versus the auditor's CAMA estimate price. So the value doesn't tell us much. 
+
+
+
+
+Who now owns the most land bank properties? 
+
+
+```{r}
+datatable(Lawrence_data %>% filter(Land_Bank==1) %>%  group_by(OWNER) %>% summarize(Total=n()))
+```
+The bulk haven't been sold. One couple has 14. 
+
+
+
+How many properties were just given to the land bank?
+```{r}
+Lawrence_data %>% filter(Land_Bank==1) %>% filter(Certified_Delinquent_Year==0 | is.na(Certified_Delinquent_Year)) %>% nrow()
+```
+
+Some properties were not  delinquent- the amount owed is 0. We are going to exclude them because they were probably just given to the land bank. (This is legal if they agree.) 
+```{r}
+Lawrence_data %>% filter(amount_owed<=0) %>% nrow()
+
+(Lawrence_data %>% filter(amount_owed<=0) %>% nrow()) / (Lawrence_data %>% nrow())
+
+Lawrence_data <- Lawrence_data %>% filter(amount_owed>0)
+```
+
+
+Also there is no certified year for 5 properties. These are all land bank properties who owe little money. 
+```{r}
+Lawrence_data <- Lawrence_data %>% filter(Certified_Delinquent_Year>0)
+```
+
+
+What does the distribution look like for the amount owed? 
+
+```{r}
+ggplot(Lawrence_data, aes(amount_owed, color=Land_Bank)) +
+  stat_bin(binwidth=1000, fill="white")+
+  stat_bin(binwidth=1000, geom="text", aes(label=..count..), vjust=2.5) 
+```
+
+So the vast majority (3282) owe less than $1000. 
+
+What's the mean and median for all the properties in our dataset? 
+
+```{r}
+summary(Lawrence_data$amount_owed)
+```
+
+What about land bank properties? 
+
+```{r}
+Land_Bank <- Lawrence_data %>% 
+  filter(Land_Bank==1) 
+
+summary(Land_Bank$amount_owed)
+
+```
+
+Graphing that
+```{r}
+ggplot(Land_Bank, aes(amount_owed, color=Land_Bank)) +
+  stat_bin(binwidth=1000, fill="white")+
+  stat_bin(binwidth=1000, geom="text", aes(label=..count..), vjust=2.5) 
+```
+
+
+And non-land bank properties?
+```{r}
+Non_Land_Bank <- 
+  Lawrence_data %>% filter(Land_Bank==0) 
+
+summary(Non_Land_Bank$amount_owed)
+```
+```{r}
+ggplot(Non_Land_Bank, aes(amount_owed, color=Land_Bank)) +
+  stat_bin(binwidth=1000, fill="white")+
+  stat_bin(binwidth=1000, geom="text", aes(label=..count..), vjust=2.5)
+```
+
+
+Now let's look at how long properties have been on the delinquent list, or were on the delinquent list before remdiation (or not). Keep in mind that to be on the delinquent list, you have to have not paid your taxes for an entire year. (In Ohio.)
+
+```{r}
+ggplot(Lawrence_data, aes(x=years_delinquent))+
+  geom_bar()+
+  stat_bin(binwidth=1, geom="text", aes(label=..count..), vjust=-2.5) 
+```
+
+
+
+So most people are only a few years behind but some have been on the list quite a while. 
+
+Note: It looks like *Covid* messed us up a bit as there are very few 2021 delinquents, probably because of the freeze. 
+
+
+Just looking at land bank properties now: 
+
+
+```{r}
+ggplot(Land_Bank, aes(x=years_delinquent))+
+  geom_bar()+
+  stat_bin(binwidth=1, geom="text", aes(label=..count..), vjust=-2.5) 
+```
+
+Verus non-land bank
+
+
+```{r}
+ggplot(Non_Land_Bank, aes(x=years_delinquent))+
+  geom_bar()+
+  stat_bin(binwidth=1, geom="text", aes(label=..count..), vjust=-2.5) 
+```
+
+Okay next let's take a look at how our variables correlate with the outcome. 
+
+
+```{r}
+Lawrence_ML  <-  Lawrence_data %>% 
+  mutate(Land_Bank=as.factor(Land_Bank)) %>%  #`mapping` color column must be categorical, not numeric
+  select(-OWNER, -ADDRESS, -Certified_Delinquent_Year, -PARCEL, -ACRES)  #factors that wouldn't influence the data (like owner) or we don't have enough data (Total Value ) Also apparently quite a few parcels are listed as 0 acres legally though they actually do have size in other places. See, eg https://lawrencecountyauditor.org/Parcel?Parcel=32-078-1600.000
+
+Lawrence_ML  <- as.data.frame(Lawrence_ML) #because sf dataframes act weird here
+
+Lawrence_ML  <- Lawrence_ML %>% 
+    select(-geometry)
+  
+ggpairs(Lawrence_ML, aes(col=Land_Bank), progress = FALSE)
+
+```
+
+Now for the machine learning part.
+
+First, we are going to create a few different versions of our machine learning dataset and see how each performs. Our theory is that officials favor properties close to the river. But what does "close" mean? Within a mile? Within a half mile? Just the physical distance? We are going to test each one and see if there is an effect. Or if there is an affect at all. 
+
+#Creating Different machine learning datasets
+
+Most ML algorithms assume that variables are independent, whereas here we created three variables which are dependent upon each other. (For example, if you are within a half mile, you are also within a mile.) We are going to see if any of these variables hold up. 
+
+```{r}
+Lawrence_ML_Distance <- Lawrence_ML %>% 
+  select(-Within_half_mile, -Within_mile)
+
+Lawrence_ML_Within_half_mile <- Lawrence_ML %>% 
+  select(-Distance_To_River_In_Meters, -Within_mile)
+
+Lawrence_ML_Within_mile <- Lawrence_ML %>% 
+  select(-Within_half_mile, -Distance_To_River_In_Meters)
+
+Lawrence_ML_No_Distance <- Lawrence_ML %>% 
+  select(-Within_half_mile, -Distance_To_River_In_Meters, -Distance_To_River_In_Meters)
+```
+
+
+
+Here, we're going to use downsampling, (AKA undersampling)- we randomly remove observations from the majority class until it's the same size as the minority class and both classes can have the same effect on the machine learning model we're training. 
+
+In other words, it could be that the computer is simply picking "not land bank" because Lank Bank properties are only 362 of the 5176 delinquent, or 6.9%.
+
+
+```{r}
+stack_recipe <- recipe(Land_Bank~ ., data = Lawrence_Machine_Learning) %>% 
+    step_downsample(Land_Bank)
+
+stack_prep <- prep(stack_recipe)
+
+stack_down <- bake(stack_prep, new_data = NULL)
+
+stack_down %>%
+    count(Land_Bank)
+```
+
+
+Decisions Trees 
+```{r}
+library(mlr) 
+library(FSelector) 
+library(rpart.plot)
+glimpse(stack_down)
+
+set.seed(1000) 
+train_index <- sample(1:nrow(stack_down), 0.8 * nrow(stack_down)) 
+test_index <- setdiff(1:nrow(stack_down), train_index) 
+train <- stack_down[train_index,] 
+test <- stack_down[test_index,]
+
+list( train = summary(train), test = summary(test) )
+
+(dt_task <- makeClassifTask(data=train, target="Land_Bank"))
+
+(dt_prob <- makeLearner('classif.rpart', predict.type="prob"))
+
+#generateFilterValuesData(dt_task, method = c("FSelector_information.gain","FSelector_chi.squared", "FSelector_gain.ratio")) %>% plotFilterValues()
+
+generateFilterValuesData(dt_task, method = "FSelector_information.gain") %>% plotFilterValues()
+
+generateFeatureImportanceData(task=dt_task, learner = dt_prob,measure = tpr, interaction = FALSE)
+
+```
+
+So no surprise the amount owed is most important but not as important as we thought.
+
+
+
+```{r}
+set.seed(1000) 
+train <- select(train, -Within_mile, -Within_half_mile) 
+test <- select(test, -Within_mile, -Within_half_mile)
+list( train = summary(train), test = summary(test) )
+```
+
+
+And now machine learning
+
+```{r}
+(dt_task <- makeClassifTask(data=train, target="Land_Bank"))
+```
+
+
+
+```{r}
+getParamSet("classif.rpart")
+```
+
+Tuning hyperparameters
+
+
+```{r}
+dt_param <- makeParamSet( 
+makeDiscreteParam("minsplit", values=seq(5,10,1)), 
+makeDiscreteParam("minbucket", values=seq(round(5/3,0), round(10/3,0), 1)), 
+makeNumericParam("cp", lower = 0.01, upper = 0.05), 
+makeDiscreteParam("maxcompete", values=6), 
+makeDiscreteParam("usesurrogate", values=0), 
+makeDiscreteParam("maxdepth", values=10) )
+
+
+ctrl = makeTuneControlGrid()
+
+rdesc = makeResampleDesc("CV", iters = 3L, stratify=TRUE)
+
+
+set.seed(1000) 
+(dt_tuneparam <- tuneParams(learner=dt_prob, 
+                 resampling=rdesc, 
+                 measures=list(tpr,auc, fnr, mmce, tnr, setAggregation(tpr, test.sd)), 
+                 par.set=dt_param, 
+                 control=ctrl, 
+                 task=dt_task, 
+                 show.info = TRUE) )
+
+
+list( `Optimal HyperParameters` = dt_tuneparam$x, 
+      `Optimal Metrics` = dt_tuneparam$y )
+
+
+dtree <- setHyperPars(dt_prob, par.vals = dt_tuneparam$x)
+
+set.seed(1000) 
+dtree_train <- train(learner=dtree, task=dt_task) 
+getLearnerModel(dtree_train)
+
+rpart.plot(dtree_train$learner.model, roundint=FALSE, varlen=3, type = 3, clip.right.labs = FALSE, yesno = 2)
+
+```
+
+
+Here we can see where the decision tree created its leaves!  
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
