@@ -399,6 +399,16 @@ What's the mean and median for all the properties in our dataset?
 summary(Lawrence_data$amount_owed)
 ```
 
+
+
+```{r}
+Lawrence_Delinquent_Year <-  Lawrence_data %>% filter(Land_Bank=="0") %>% filter(amount_owed>1000) 
+
+mean(Lawrence_Delinquent_Year$years_delinquent, na.rm=TRUE)
+```
+
+
+
 What about land bank properties? 
 
 ```{r}
@@ -415,6 +425,14 @@ ggplot(Land_Bank, aes(amount_owed, color=Land_Bank)) +
   stat_bin(binwidth=1000, fill="white")+
   stat_bin(binwidth=1000, geom="text", aes(label=..count..), vjust=2.5) 
 ```
+
+```{r}
+Land_Bank %>% filter(amount_owed<5000) %>% nrow()
+316/362
+```
+
+
+
 
 
 And non-land bank properties?
