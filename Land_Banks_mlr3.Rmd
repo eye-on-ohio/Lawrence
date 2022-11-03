@@ -235,6 +235,39 @@ Lawrence_data$amount_owed <- as.double(Lawrence_data$amount_owed)
   
 
 ```
+This causes some properties to come up twice, as they have two shapes. As per the Auditor's office (they are the ones who put this data on the web) and they said that actually this was correct- they called it a "backsplit" and said sometimes people take out parcels, etc. 
+
+```{r}
+duplicates <- Lawrence_data %>% 
+  group_by(PARCEL) %>% summarize(geometry=st_union(geometry))
+
+duplicates
+```
+
+
+Then adding that back into lawrence data:
+```{r}
+not_dup <- Lawrence_data %>% 
+  filter(!(PARCEL %in% duplicates$PARCEL))
+
+dups <- Lawrence_data %>% 
+  filter(PARCEL %in% duplicates$PARCEL) %>% 
+  distinct(PARCEL, .keep_all = TRUE) %>% 
+  select(-geometry) %>% 
+  mutate(geometry=duplicates$geometry[match(PARCEL,duplicates$PARCEL)])
+
+Lawrence_data <- rbind(not_dup, dups)
+
+```
+
+land bank properties: 386 +
+delinquent properties: 5145
+Total properties should be 5531 and Lawrence_data is 5202
+
+
+This is a small portion of our dataset, but making a note here that this has been exported and we will ask the county about it. 
+
+no_map <- filter(Lawrence_Delinquents_All, !(Lawrence_Delinquents_All$`Parcel Number` %in% Lawrence_data$PARCEL))
 
 
 
